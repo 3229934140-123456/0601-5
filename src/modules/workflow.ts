@@ -312,7 +312,7 @@ export class WorkflowManager {
       }
 
       step.result = result;
-      step.usage = this.calculateStepUsage(step, result);
+      step.usage = this.calculateStepUsage(step, result, params);
       step.status = 'completed';
       step.completedAt = Date.now();
       step.duration = step.completedAt - step.startedAt;
@@ -715,7 +715,7 @@ export class WorkflowManager {
     };
   }
 
-  private calculateStepUsage(step: WorkflowStep, result: unknown): WorkflowStep['usage'] {
+  private calculateStepUsage(step: WorkflowStep, result: unknown, params: Record<string, unknown>): WorkflowStep['usage'] {
     const usage: NonNullable<WorkflowStep['usage']> = {
       tokens: 0,
       inputTokens: 0,
@@ -728,7 +728,7 @@ export class WorkflowManager {
 
     switch (step.type) {
       case 'document.summarize': {
-        const content = step.params.content as string || '';
+        const content = (params.content as string) || (step.params.content as string) || '';
         const summary = (resultObj.summary as string) || '';
         usage.inputTokens = content.length;
         usage.outputTokens = summary.length;
@@ -737,7 +737,7 @@ export class WorkflowManager {
         break;
       }
       case 'document.extractKeyPoints': {
-        const content = step.params.content as string || '';
+        const content = (params.content as string) || (step.params.content as string) || '';
         const keyPoints = (resultObj.keyPoints as Array<{ text: string }>) || [];
         const outputLen = keyPoints.reduce((sum, kp) => sum + kp.text.length, 0);
         usage.inputTokens = content.length;
@@ -747,7 +747,7 @@ export class WorkflowManager {
         break;
       }
       case 'document.classify': {
-        const content = step.params.content as string || '';
+        const content = (params.content as string) || (step.params.content as string) || '';
         usage.inputTokens = content.length;
         usage.outputTokens = 20;
         usage.tokens = usage.inputTokens + usage.outputTokens;
@@ -755,7 +755,7 @@ export class WorkflowManager {
         break;
       }
       case 'document.sensitiveCheck': {
-        const content = step.params.content as string || '';
+        const content = (params.content as string) || (step.params.content as string) || '';
         const hits = (resultObj.hits as Array<unknown>) || [];
         usage.inputTokens = content.length;
         usage.outputTokens = hits.length * 10;

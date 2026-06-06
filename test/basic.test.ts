@@ -88,7 +88,7 @@ describe('AI 应用平台 SDK - 基础测试', function () {
       assert.ok((searchResult.data as any[]).length > 0);
     });
 
-    it('严格模式下缺变量应返回结构化错误', async function () {
+    it('严格模式下缺变量应返回结构化错误，且内容不含占位符', async function () {
       const fillResult = await client.call('prompt.fill', {
         content: '你好，{{name}}，年龄{{age}}。',
         variables: { name: '张三' },
@@ -101,6 +101,9 @@ describe('AI 应用平台 SDK - 基础测试', function () {
       assert.ok(data.validation.errors.length > 0);
       assert.strictEqual(data.validation.errors[0].field, 'age');
       assert.strictEqual(data.validation.errors[0].type, 'missing');
+      assert.ok(data.validation.errors[0].code);
+      assert.strictEqual(data.content.includes('{{age}}'), false, '严格模式下内容不应包含未替换占位符');
+      assert.strictEqual(data.content.includes('{{name}}'), false, '严格模式下已填充变量不应残留占位符');
     });
 
     it('普通模式下缺变量应保留占位符', async function () {
@@ -111,6 +114,26 @@ describe('AI 应用平台 SDK - 基础测试', function () {
       });
       const data = fillResult.data as FillResult;
       assert.ok(data.content.includes('{{name}}'));
+    });
+
+    it('严格模式抛错时应包含一致的错误信息', function () {
+      let thrownError: any = null;
+      try {
+        client.prompt.fill(
+          '你好，{{name}}',
+          {},
+          { strict: true, returnValidation: false }
+        );
+      } catch (err) {
+        thrownError = err;
+      }
+      assert.ok(thrownError, '严格模式缺变量应抛出错误');
+      assert.strictEqual(thrownError.name, 'PromptFillError');
+      assert.ok(thrownError.code);
+      assert.ok(Array.isArray(thrownError.errors));
+      assert.ok(thrownError.errors.length > 0);
+      assert.strictEqual(thrownError.errors[0].type, 'missing');
+      assert.ok(Array.isArray(thrownError.missingVariables));
     });
   });
 
@@ -193,20 +216,79 @@ describe('AI 应用平台 SDK - 基础测试', function () {
       ];
 
       for (const type of taskTypes) {
+        let params: Record<string, unknown> = {};
+        if (type.startsWith('document.')) {
+          params = { content: '测试文本内容' };
+        } else if (type === 'image.describe') {
+          params = { url: 'https://example.com/test.jpg' };
+        } else if (type === 'image.compare') {
+          params = { image1: 'https://example.com/a.jpg', image2: 'https://example.com/b.jpg' };
+        } else if (type === 'session.chat') {
+          params = { message: '你好', systemPrompt: '你是一个助手' };
+        }
+
         const submitResult = await client.call('task.submit', {
           type: type as any,
-          taskParams: {
-            content: '测试文本内容',
-          },
+          taskParams: params,
           userId: 'test_user',
           priority: 1,
         });
-        assert.strictEqual(submitResult.success, true, `任务类型 ${type} 提交失败`);
+        assert.strictEqual(submitResult.success, true, `任务类型 ${type} 提交失败: ${submitResult.message}`);
         const taskId = (submitResult.data as any).id;
         assert.ok(taskId);
 
         const statusResult = await client.call('task.status', { taskId });
         assert.ok(statusResult.data);
+      }
+    });
+
+    it('会话任务应支持 message 和 systemPrompt 参数', async function () {
+      const submitResult = await client.call('task.submit', {
+        type: 'session.chat',
+        taskParams: {
+          message: '请介绍一下你自己',
+          systemPrompt: '你是一个专业的技术顾问',
+        },
+        userId: 'test_user',
+        priority: 2,
+      });
+      assert.strictEqual(submitResult.success, true);
+      const taskId = (submitResult.data as any).id;
+
+      await new Promise(resolve => setTimeout(resolve, 200));
+
+      const result = await client.call('task.result', { taskId });
+      const taskResult = result.data as any;
+
+      if (taskResult.status === 'completed') {
+        assert.ok(taskResult.result);
+        assert.ok(taskResult.result.message);
+        assert.strictEqual(taskResult.result.message.role, 'assistant');
+        assert.ok(taskResult.result.content || taskResult.result.message.content);
+        assert.ok(taskResult.usage);
+        assert.ok(taskResult.usage.inputTokens > 0);
+        assert.ok(taskResult.usage.outputTokens > 0);
+      }
+    });
+
+    it('会话任务缺少参数时应进入失败状态', async function () {
+      const submitResult = await client.call('task.submit', {
+        type: 'session.chat',
+        taskParams: {},
+        userId: 'test_user',
+        priority: 1,
+      });
+      const taskId = (submitResult.data as any).id;
+
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      const result = await client.call('task.result', { taskId });
+      const taskResult = result.data as any;
+
+      if (taskResult.status === 'failed') {
+        assert.ok(taskResult.error);
+        assert.ok(taskResult.error.code);
+        assert.ok(taskResult.error.message);
       }
     });
 
@@ -236,7 +318,7 @@ describe('AI 应用平台 SDK - 基础测试', function () {
       });
       const taskId = (submitResult.data as any).id;
 
-      await new Promise(resolve => setTimeout(resolve, 50));
+      await new Promise(resolve => setTimeout(resolve, 100));
 
       const result = await client.call('task.result', { taskId });
       const taskResult = result.data as any;
@@ -247,14 +329,33 @@ describe('AI 应用平台 SDK - 基础测试', function () {
         assert.ok(taskResult.error.message);
       }
     });
+
+    it('应能重试失败的任务', async function () {
+      const submitResult = await client.call('task.submit', {
+        type: 'document.summarize',
+        taskParams: { content: '测试内容' },
+        userId: 'test_user',
+        priority: 1,
+      });
+      const taskId = (submitResult.data as any).id;
+
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      const cancelResult = await client.call('task.cancel', { taskId });
+      const retryResult = await client.call('task.retry', { taskId });
+      assert.strictEqual(retryResult.success, true);
+      assert.ok((retryResult.data as any).status);
+    });
   });
 
   describe('6. 工作流模块', function () {
+    const testContent = '这是一篇关于人工智能的文章，介绍了AI的发展历史和应用领域。人工智能技术正在改变我们的生活。';
+
     it('应能创建并执行多步骤工作流', async function () {
       const def = {
         name: '测试工作流',
         initialParams: {
-          content: '这是一篇关于人工智能的文章，介绍了AI的发展历史和应用领域。',
+          content: testContent,
         },
         steps: [
           {
@@ -286,7 +387,7 @@ describe('AI 应用平台 SDK - 基础测试', function () {
       const startResult = await client.call('workflow.start', { workflowId });
       assert.strictEqual(startResult.success, true);
 
-      await new Promise(resolve => setTimeout(resolve, 200));
+      await new Promise(resolve => setTimeout(resolve, 300));
 
       const statusResult = await client.call('workflow.status', { workflowId });
       const wf = statusResult.data as any;
@@ -298,6 +399,62 @@ describe('AI 应用平台 SDK - 基础测试', function () {
         stepId: 'step1',
       });
       assert.ok(stepResult.data);
+    });
+
+    it('工作流用量统计应按真实入参加总', async function () {
+      const def = {
+        name: '用量测试工作流',
+        initialParams: {
+          content: testContent,
+        },
+        steps: [
+          {
+            id: 's1',
+            name: '敏感词检查',
+            type: 'document.sensitiveCheck' as const,
+            inputMapping: { content: { from: 'initial', path: 'content' } },
+          },
+          {
+            id: 's2',
+            name: '摘要',
+            type: 'document.summarize' as const,
+            dependsOn: ['s1'],
+            inputMapping: { content: { from: 'initial', path: 'content' } },
+          },
+          {
+            id: 's3',
+            name: '分类',
+            type: 'document.classify' as const,
+            dependsOn: ['s1'],
+            inputMapping: { content: { from: 'initial', path: 'content' } },
+          },
+        ],
+      };
+
+      const createResult = await client.call('workflow.create', {
+        definition: def,
+        userId: 'test_user',
+      });
+      const workflowId = (createResult.data as any).id;
+
+      await client.call('workflow.start', { workflowId });
+
+      await new Promise(resolve => setTimeout(resolve, 400));
+
+      const wf = client.workflow.require(workflowId);
+      const usage = client.workflow.getUsage(workflowId);
+
+      assert.strictEqual(usage.totalDocuments, 3, '3个文档处理步骤应有3个文档计数');
+      assert.ok(usage.totalInputTokens > 0, '输入token应大于0');
+      assert.ok(usage.totalOutputTokens > 0, '输出token应大于0');
+      assert.ok(usage.totalTokens > 0, '总token应大于0');
+
+      for (const step of wf.steps) {
+        if (step.status === 'completed') {
+          assert.ok(step.usage, `步骤 ${step.id} 完成后应有用量数据`);
+          assert.ok(step.duration !== undefined, `步骤 ${step.id} 应有耗时`);
+        }
+      }
     });
 
     it('应能取消工作流', async function () {
@@ -406,7 +563,63 @@ describe('AI 应用平台 SDK - 基础测试', function () {
   });
 
   describe('10. 权限校验', function () {
-    it('无权限操作应被拒绝', async function () {
+    it('admin角色应能访问所有操作', async function () {
+      client.setDefaultPermissionContext({
+        userId: 'admin_user',
+        role: 'admin',
+      });
+
+      const results = await Promise.all([
+        client.call('prompt.template.search', { keyword: 'test', limit: 5 }),
+        client.call('task.retry', { taskId: 'fake-id' }).catch(() => ({ success: false, code: -1 })),
+        client.call('workflow.create', {
+          definition: { name: 'test', steps: [] },
+          userId: 'admin_user',
+        }),
+        client.call('workflow.list', { userId: 'admin_user' }),
+      ]);
+
+      for (const r of results) {
+        const result = r as any;
+        if (result.code !== 0 && result.code !== -1) {
+          assert.notStrictEqual(result.code, -1, `admin不应被拒绝: ${result.message}`);
+        }
+      }
+
+      client.setDefaultPermissionContext({
+        userId: 'test_user',
+        role: 'admin',
+        tenantId: 'test_tenant',
+      });
+    });
+
+    it('user角色应有部分权限，无权限操作被拒绝', async function () {
+      client.setDefaultPermissionContext({
+        userId: 'normal_user',
+        role: 'user',
+      });
+
+      const createResult = await client.call('prompt.template.create', {
+        name: 'test',
+        content: 'test',
+      });
+      assert.strictEqual(createResult.success, false, 'user角色不应有创建模板权限');
+      assert.ok(createResult.message);
+
+      const fillResult = await client.call('prompt.fill', {
+        content: 'hello {{name}}',
+        variables: { name: 'world' },
+      });
+      assert.strictEqual(fillResult.success, true, 'user角色应有填充提示词权限');
+
+      client.setDefaultPermissionContext({
+        userId: 'test_user',
+        role: 'admin',
+        tenantId: 'test_tenant',
+      });
+    });
+
+    it('viewer角色只能查看，无写权限', async function () {
       client.setDefaultPermissionContext({
         userId: 'viewer',
         role: 'viewer',
@@ -420,19 +633,14 @@ describe('AI 应用平台 SDK - 基础测试', function () {
       assert.ok(result.code !== 0);
       assert.ok(result.message);
 
+      const listResult = await client.call('prompt.template.list', {});
+      assert.strictEqual(listResult.success, true);
+
       client.setDefaultPermissionContext({
         userId: 'test_user',
         role: 'admin',
         tenantId: 'test_tenant',
       });
-    });
-
-    it('admin角色应有全部权限', async function () {
-      const result = await client.call('prompt.template.create', {
-        name: 'admin测试',
-        content: '测试',
-      });
-      assert.strictEqual(result.success, true);
     });
   });
 

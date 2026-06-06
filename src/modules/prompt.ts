@@ -18,8 +18,9 @@ export interface PromptVariable {
 
 export interface ValidationError {
   field: string;
+  type: 'missing' | 'type_mismatch' | 'invalid_option' | 'out_of_range' | 'pattern_mismatch' | 'unknown_variable';
   message: string;
-  code: 'required' | 'type_mismatch' | 'invalid_option' | 'out_of_range' | 'pattern_mismatch' | 'unknown_variable';
+  code: string;
   value?: unknown;
 }
 
@@ -319,12 +320,12 @@ export class PromptManager {
           return defaultValue.trim();
         }
 
+        missingVariables.push(varName);
+
         if (opts.strict) {
-          missingVariables.push(varName);
-          return match;
+          return '';
         }
 
-        missingVariables.push(varName);
         return match;
       }
 
@@ -340,27 +341,34 @@ export class PromptManager {
     if (opts.strict && missingVariables.length > 0) {
       const errors: ValidationError[] = missingVariables.map((name) => ({
         field: name,
+        type: 'missing',
         message: `Required variable "${name}" is not provided`,
-        code: 'required' as const,
+        code: 'REQUIRED_VARIABLE_MISSING',
         value: variables[name],
       }));
 
       if (opts.returnValidation) {
         return {
           content: result,
-          filledVariables,
-          missingVariables,
+          filledVariables: [...new Set(filledVariables)],
+          missingVariables: [...new Set(missingVariables)],
           variables,
-          validation: { valid: false, errors },
+          validation: {
+            valid: false,
+            errors,
+            warnings: [],
+          },
         };
       }
 
-      throw {
-        name: 'PromptFillError',
-        message: `Missing required variables: ${missingVariables.join(', ')}`,
-        errors,
-        missingVariables,
-      };
+      const error: any = new Error(
+        `Missing required variables: ${missingVariables.join(', ')}`
+      );
+      error.name = 'PromptFillError';
+      error.code = 'REQUIRED_VARIABLE_MISSING';
+      error.errors = errors;
+      error.missingVariables = [...new Set(missingVariables)];
+      throw error;
     }
 
     if (opts.trimWhitespace) {
@@ -449,8 +457,9 @@ export class PromptManager {
       if (variable.required && (value === undefined || value === null || value === '')) {
         errors.push({
           field: variable.name,
+          type: 'missing',
           message: `Variable "${variable.name}" is required`,
-          code: 'required',
+          code: 'REQUIRED_VARIABLE_MISSING',
           value,
         });
         continue;
@@ -466,24 +475,27 @@ export class PromptManager {
           if (isNaN(numValue)) {
             errors.push({
               field: variable.name,
+              type: 'type_mismatch',
               message: `Variable "${variable.name}" must be a number`,
-              code: 'type_mismatch',
+              code: 'TYPE_MISMATCH',
               value,
             });
           } else {
             if (variable.min !== undefined && numValue < variable.min) {
               errors.push({
                 field: variable.name,
+                type: 'out_of_range',
                 message: `Variable "${variable.name}" must be >= ${variable.min}`,
-                code: 'out_of_range',
+                code: 'VALUE_OUT_OF_RANGE',
                 value,
               });
             }
             if (variable.max !== undefined && numValue > variable.max) {
               errors.push({
                 field: variable.name,
+                type: 'out_of_range',
                 message: `Variable "${variable.name}" must be <= ${variable.max}`,
-                code: 'out_of_range',
+                code: 'VALUE_OUT_OF_RANGE',
                 value,
               });
             }
@@ -495,8 +507,9 @@ export class PromptManager {
           if (typeof value !== 'boolean' && value !== 'true' && value !== 'false') {
             errors.push({
               field: variable.name,
+              type: 'type_mismatch',
               message: `Variable "${variable.name}" must be a boolean`,
-              code: 'type_mismatch',
+              code: 'TYPE_MISMATCH',
               value,
             });
           }
@@ -507,8 +520,9 @@ export class PromptManager {
           if (variable.options && !variable.options.includes(String(value))) {
             errors.push({
               field: variable.name,
+              type: 'invalid_option',
               message: `Variable "${variable.name}" must be one of: ${variable.options.join(', ')}`,
-              code: 'invalid_option',
+              code: 'INVALID_OPTION',
               value,
             });
           }
@@ -522,8 +536,9 @@ export class PromptManager {
             if (!regex.test(String(value))) {
               errors.push({
                 field: variable.name,
+                type: 'pattern_mismatch',
                 message: `Variable "${variable.name}" does not match pattern`,
-                code: 'pattern_mismatch',
+                code: 'PATTERN_MISMATCH',
                 value,
               });
             }
@@ -535,8 +550,9 @@ export class PromptManager {
           if (!Array.isArray(value) && typeof value !== 'string') {
             errors.push({
               field: variable.name,
+              type: 'type_mismatch',
               message: `Variable "${variable.name}" must be an array or string`,
-              code: 'type_mismatch',
+              code: 'TYPE_MISMATCH',
               value,
             });
           }

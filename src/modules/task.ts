@@ -223,15 +223,30 @@ export class TaskManager {
     });
 
     this.registerHandler('image.describe', async (task, onProgress) => {
+      onProgress?.(10, '正在校验参数...');
+
+      const { url, base64, imageId, imageUrl, imageBase64, detailLevel, language } = task.params;
+
+      const finalImageUrl = url || imageUrl;
+      const finalImageBase64 = base64 || imageBase64;
+
+      if (!finalImageUrl && !finalImageBase64) {
+        const err: any = new Error('Missing required parameter: either url or base64 must be provided');
+        err.code = 'INVALID_PARAMS';
+        err.retryable = false;
+        err.details = { missingFields: ['url'] };
+        throw err;
+      }
+
       onProgress?.(20, '正在加载图片...');
       await sleep(60);
 
       onProgress?.(50, '正在分析图片...');
       const request: ImageDescribeRequest = {
-        imageUrl: task.params.imageUrl as string,
-        imageBase64: task.params.imageBase64 as string,
-        detailLevel: task.params.detailLevel as 'low' | 'medium' | 'high',
-        language: task.params.language as string,
+        imageUrl: finalImageUrl as string,
+        imageBase64: finalImageBase64 as string,
+        detailLevel: detailLevel as 'low' | 'medium' | 'high',
+        language: language as string,
       };
 
       onProgress?.(80, '正在生成描述...');
@@ -278,29 +293,79 @@ export class TaskManager {
     });
 
     this.registerHandler('session.chat', async (task, onProgress) => {
-      onProgress?.(20, '正在构建上下文...');
-      const messages = task.params.messages as { role: string; content: string }[];
+      onProgress?.(10, '正在校验参数...');
+
+      const {
+        message,
+        messages,
+        sessionId,
+        systemPrompt,
+        model,
+        temperature,
+        maxTokens,
+      } = task.params;
+
+      let chatMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [];
+
+      if (systemPrompt) {
+        chatMessages.push({ role: 'system', content: String(systemPrompt) });
+      }
+
+      if (messages && Array.isArray(messages) && messages.length > 0) {
+        chatMessages = chatMessages.concat(
+          messages.map((m: any) => ({
+            role: m.role || 'user',
+            content: String(m.content),
+          }))
+        );
+      } else if (message) {
+        chatMessages.push({ role: 'user', content: String(message) });
+      } else {
+        const err: any = new Error('Missing required parameter: either message or messages must be provided');
+        err.code = 'INVALID_PARAMS';
+        err.retryable = false;
+        err.details = { missingFields: ['message'] };
+        throw err;
+      }
+
+      if (chatMessages.length === 0 || !chatMessages.some(m => m.role === 'user')) {
+        const err: any = new Error('At least one user message is required');
+        err.code = 'INVALID_PARAMS';
+        err.retryable = false;
+        err.details = { missingFields: ['user message'] };
+        throw err;
+      }
+
+      onProgress?.(30, '正在构建请求...');
 
       const request: ChatRequest = {
-        messages: messages as ChatRequest['messages'],
-        model: task.params.model as string,
-        temperature: task.params.temperature as number,
-        maxTokens: task.params.maxTokens as number,
+        messages: chatMessages,
+        model: model as string | undefined,
+        temperature: temperature as number | undefined,
+        maxTokens: maxTokens as number | undefined,
       };
 
       onProgress?.(50, '正在生成回复...');
       const response = await this.aiServiceManager.chat(request);
 
+      onProgress?.(90, '正在处理结果...');
+
+      const reply = {
+        role: 'assistant' as const,
+        content: response.content,
+        tokens: response.usage.outputTokens,
+      };
+
       onProgress?.(100, '回复生成完成');
 
       return {
         result: {
-          message: {
-            role: 'assistant',
-            content: response.content,
-          },
+          message: reply,
+          reply,
           model: response.model,
           finishReason: response.finishReason,
+          messages: [...chatMessages, reply],
+          sessionId: sessionId || null,
         },
         usage: {
           inputTokens: response.usage.inputTokens,
