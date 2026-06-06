@@ -149,6 +149,12 @@ export abstract class BaseAIServiceAdapter {
     this.config = config;
   }
 
+  get name(): string {
+    return `${this.provider}-${this.type}`;
+  }
+
+  abstract getSupportedModels(): string[];
+
   abstract supports(operation: string): boolean;
 
   isRetryable(error: AIServiceError): boolean {

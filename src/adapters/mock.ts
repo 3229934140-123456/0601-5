@@ -36,6 +36,10 @@ export class MockTextAIService extends BaseAIServiceAdapter {
     return ['session.chat', 'text.generate'].includes(operation);
   }
 
+  getSupportedModels(): string[] {
+    return ['mock-text-v1', 'mock-text-v2', 'mock-text-lite'];
+  }
+
   async chat(request: ChatRequest): Promise<ChatResponse> {
     await sleep(this.delay);
 
