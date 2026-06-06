@@ -4,8 +4,9 @@ import { RetryUtil } from '../core/retry';
 import { PermissionManager } from '../core/permission';
 import { UsageManager } from '../core/usage';
 import { AuditManager } from '../core/audit';
+import { AIServiceManager } from '../adapters';
 import { SessionManager, ChatMessage, ChatOptions } from '../modules/session';
-import { PromptManager, PromptTemplate } from '../modules/prompt';
+import { PromptManager, FillPromptOptions, FillResult } from '../modules/prompt';
 import {
   DocumentManager,
   SummaryResult,
@@ -14,7 +15,14 @@ import {
   SensitiveCheckResult,
 } from '../modules/document';
 import { ImageManager, ImageDescriptionResult, ImageCompareResult } from '../modules/image';
-import { TaskManager, Task, TaskType, TaskSubmitOptions } from '../modules/task';
+import { TaskManager, Task, TaskType, TaskSubmitOptions, TaskStatus } from '../modules/task';
+import {
+  WorkflowManager,
+  Workflow,
+  WorkflowDefinition,
+  WorkflowStep,
+  WorkflowStatus,
+} from '../modules/workflow';
 import {
   AIPlatformConfig,
   BaseResponse,
@@ -33,17 +41,25 @@ export class AIPlatformClient {
   readonly permission: PermissionManager;
   readonly usage: UsageManager;
   readonly audit: AuditManager;
+  readonly aiService: AIServiceManager;
   readonly session: SessionManager;
   readonly prompt: PromptManager;
   readonly document: DocumentManager;
   readonly image: ImageManager;
   readonly task: TaskManager;
+  readonly workflow: WorkflowManager;
 
   private defaultPermissionContext?: PermissionContext;
 
   constructor(config: AIPlatformConfig) {
     this.config = new ConfigManager(config);
     this.config.validate();
+
+    this.aiService = new AIServiceManager();
+    this.aiService.setRetryConfig(
+      config.maxRetries || 3,
+      config.retryDelay || 1000
+    );
 
     this.permission = new PermissionManager();
     this.usage = new UsageManager();
@@ -52,7 +68,8 @@ export class AIPlatformClient {
     this.prompt = new PromptManager();
     this.document = new DocumentManager();
     this.image = new ImageManager();
-    this.task = new TaskManager();
+    this.task = new TaskManager(this.aiService);
+    this.workflow = new WorkflowManager(this.aiService);
   }
 
   setDefaultPermissionContext(context: PermissionContext): void {
@@ -103,9 +120,17 @@ export class AIPlatformClient {
     module: ModuleType,
     operation: OperationType,
     usage: UsageInfo,
-    tenantId?: string
+    options: {
+      tenantId?: string;
+      success?: boolean;
+      traceId?: string;
+    } = {}
   ): void {
-    this.usage.record(userId, module, operation, usage, tenantId);
+    this.usage.record(userId, module, operation, usage, {
+      tenantId: options.tenantId,
+      success: options.success ?? true,
+      traceId: options.traceId,
+    });
   }
 
   private recordAudit(
@@ -156,13 +181,14 @@ export class AIPlatformClient {
       }, options);
 
       const duration = Date.now() - startTime;
-      const usage: UsageInfo = {
-        requests: 1,
-        duration,
-      };
+      const usage = this.extractUsage(operation, result, duration);
 
       const module = operation.split('.')[0] as ModuleType;
-      this.recordUsage(permContext.userId, module, operation, usage, permContext.tenantId);
+      this.recordUsage(permContext.userId, module, operation, usage, {
+        tenantId: permContext.tenantId,
+        success: true,
+        traceId,
+      });
       this.recordAudit(traceId, permContext.userId, module, operation, params, true, 0, usage, permContext.tenantId);
 
       return this.createResponse(true, 0, 'success', result, traceId, usage);
@@ -176,11 +202,62 @@ export class AIPlatformClient {
       };
 
       const module = operation.split('.')[0] as ModuleType;
-      this.recordUsage(permContext.userId, module, operation, usage, permContext.tenantId);
+      this.recordUsage(permContext.userId, module, operation, usage, {
+        tenantId: permContext.tenantId,
+        success: false,
+        traceId,
+      });
       this.recordAudit(traceId, permContext.userId, module, operation, params, false, code, usage, permContext.tenantId);
 
       return this.createResponse(false, code, message, undefined, traceId, usage);
     }
+  }
+
+  private extractUsage(
+    operation: OperationType,
+    result: unknown,
+    duration: number
+  ): UsageInfo {
+    const usage: UsageInfo = {
+      requests: 1,
+      duration,
+    };
+
+    if (!result || typeof result !== 'object') {
+      return usage;
+    }
+
+    const resultObj = result as Record<string, unknown>;
+
+    if (resultObj.usage && typeof resultObj.usage === 'object') {
+      const resultUsage = resultObj.usage as Record<string, unknown>;
+      usage.inputTokens = resultUsage.inputTokens as number || 0;
+      usage.outputTokens = resultUsage.outputTokens as number || 0;
+      usage.tokens = resultUsage.tokens as number || (usage.inputTokens || 0) + (usage.outputTokens || 0);
+      usage.images = resultUsage.images as number;
+      usage.documents = resultUsage.documents as number;
+    }
+
+    if (operation.startsWith('document.')) {
+      usage.documents = usage.documents || 1;
+    } else if (operation === 'image.describe') {
+      usage.images = usage.images || 1;
+    } else if (operation === 'image.compare') {
+      usage.images = usage.images || 2;
+    } else if (operation === 'task.submit') {
+      const task = resultObj as any;
+      if (task.type) {
+        if (task.type.startsWith('document.')) {
+          usage.documents = 1;
+        } else if (task.type === 'image.describe') {
+          usage.images = 1;
+        } else if (task.type === 'image.compare') {
+          usage.images = 2;
+        }
+      }
+    }
+
+    return usage;
   }
 
   private async dispatchOperation(
@@ -209,6 +286,8 @@ export class AIPlatformClient {
         return this.handlePromptTemplateUpdate(params);
       case 'prompt.template.delete':
         return this.handlePromptTemplateDelete(params);
+      case 'prompt.template.search':
+        return this.handlePromptTemplateSearch(params);
 
       case 'document.summarize':
         return this.handleDocumentSummarize(params);
@@ -234,6 +313,25 @@ export class AIPlatformClient {
         return this.handleTaskList(params);
       case 'task.cancel':
         return this.handleTaskCancel(params);
+      case 'task.retry':
+        return this.handleTaskRetry(params);
+
+      case 'workflow.create':
+        return this.handleWorkflowCreate(params);
+      case 'workflow.start':
+        return this.handleWorkflowStart(params);
+      case 'workflow.status':
+        return this.handleWorkflowStatus(params);
+      case 'workflow.step.get':
+        return this.handleWorkflowStepGet(params);
+      case 'workflow.step.retry':
+        return this.handleWorkflowStepRetry(params);
+      case 'workflow.retry':
+        return this.handleWorkflowRetry(params);
+      case 'workflow.cancel':
+        return this.handleWorkflowCancel(params);
+      case 'workflow.list':
+        return this.handleWorkflowList(params);
 
       case 'audit.log.list':
         return this.handleAuditLogList(params);
@@ -268,7 +366,7 @@ export class AIPlatformClient {
     return result;
   }
 
-  private handleSessionChat(params: Record<string, unknown>) {
+  private async handleSessionChat(params: Record<string, unknown>) {
     const { sessionId, message, options } = params as {
       sessionId: string;
       message: string;
@@ -282,22 +380,32 @@ export class AIPlatformClient {
       content: message,
     });
 
-    const replyText = this.generateMockReply(message, session.systemPrompt);
+    const chatResult = await this.aiService.chat({
+      messages: [
+        ...(session.systemPrompt
+          ? [{ role: 'system' as const, content: session.systemPrompt }]
+          : []),
+        ...this.session.getContextMessages(sessionId, false).map((m) => ({
+          role: m.role as 'user' | 'assistant',
+          content: m.content,
+        })),
+        { role: 'user', content: message },
+      ],
+      model: options?.model || session.model,
+      temperature: options?.temperature || session.temperature,
+    });
 
     const reply = this.session.addMessage(sessionId, {
       role: 'assistant',
-      content: replyText,
-      tokens: replyText.length,
+      content: chatResult.content,
+      tokens: chatResult.usage.outputTokens,
     });
 
     return {
       message: reply,
-      usage: {
-        inputTokens: message.length,
-        outputTokens: replyText.length,
-        totalTokens: message.length + replyText.length,
-      },
-      model: session.model || 'default-model',
+      usage: chatResult.usage,
+      model: chatResult.model,
+      finishReason: chatResult.finishReason,
     };
   }
 
@@ -312,17 +420,17 @@ export class AIPlatformClient {
     return { cleared: true };
   }
 
-  private handlePromptFill(params: Record<string, unknown>) {
+  private handlePromptFill(params: Record<string, unknown>): FillResult {
     const { content, variables, options } = params as {
       content: string;
-      variables: Record<string, string | number | boolean>;
-      options?: { strict?: boolean };
+      variables: Record<string, string | number | boolean | string[]>;
+      options?: FillPromptOptions;
     };
     return this.prompt.fill(content, variables, options);
   }
 
   private handlePromptTemplateList(params: Record<string, unknown>) {
-    return this.prompt.listTemplates(params);
+    return this.prompt.listTemplates(params as Parameters<PromptManager['listTemplates']>[0]);
   }
 
   private handlePromptTemplateCreate(params: Record<string, unknown>) {
@@ -335,7 +443,7 @@ export class AIPlatformClient {
   }
 
   private handlePromptTemplateUpdate(params: Record<string, unknown>) {
-    const { id, ...updates } = params as { id: string } & Partial<Omit<PromptTemplate, 'id' | 'createdAt'>>;
+    const { id, ...updates } = params as { id: string } & Parameters<PromptManager['updateTemplate']>[1];
     return this.prompt.updateTemplate(id, updates);
   }
 
@@ -345,7 +453,12 @@ export class AIPlatformClient {
     return { deleted };
   }
 
-  private handleDocumentSummarize(params: Record<string, unknown>): SummaryResult {
+  private handlePromptTemplateSearch(params: Record<string, unknown>) {
+    const { keyword, limit } = params as { keyword: string; limit?: number };
+    return this.prompt.search(keyword, limit);
+  }
+
+  private async handleDocumentSummarize(params: Record<string, unknown>): Promise<SummaryResult & { usage?: UsageInfo }> {
     const { content, documentId, ...options } = params as {
       content?: string;
       documentId?: string;
@@ -353,72 +466,141 @@ export class AIPlatformClient {
       ratio?: number;
     };
 
+    let docContent = content;
     if (documentId) {
-      return this.document.summarizeDocument(documentId, options);
+      const doc = this.document.requireDocument(documentId);
+      docContent = doc.content;
     }
 
-    if (!content) {
+    if (!docContent) {
       throw new Error('Either content or documentId must be provided');
     }
 
-    return this.document.summarize(content, options);
+    const response = await this.aiService.summarizeDocument({
+      content: docContent,
+      maxLength: options.maxLength,
+      ratio: options.ratio,
+    });
+
+    return {
+      ...response,
+      usage: {
+        inputTokens: docContent.length,
+        outputTokens: response.summary.length,
+        tokens: docContent.length + response.summary.length,
+        documents: 1,
+        requests: 1,
+        duration: 0,
+      },
+    };
   }
 
-  private handleDocumentExtractKeyPoints(params: Record<string, unknown>): KeyPointsResult {
+  private async handleDocumentExtractKeyPoints(params: Record<string, unknown>): Promise<KeyPointsResult & { usage?: UsageInfo }> {
     const { content, documentId, ...options } = params as {
       content?: string;
       documentId?: string;
       maxPoints?: number;
-      minLength?: number;
     };
 
+    let docContent = content;
     if (documentId) {
-      return this.document.extractKeyPointsDocument(documentId, options);
+      const doc = this.document.requireDocument(documentId);
+      docContent = doc.content;
     }
 
-    if (!content) {
+    if (!docContent) {
       throw new Error('Either content or documentId must be provided');
     }
 
-    return this.document.extractKeyPoints(content, options);
+    const response = await this.aiService.extractKeyPoints({
+      content: docContent,
+      maxPoints: options.maxPoints,
+    });
+
+    const outputTokens = response.keyPoints.reduce((sum, kp) => sum + kp.text.length, 0);
+
+    return {
+      ...response,
+      usage: {
+        inputTokens: docContent.length,
+        outputTokens,
+        tokens: docContent.length + outputTokens,
+        documents: 1,
+        requests: 1,
+        duration: 0,
+      },
+    };
   }
 
-  private handleDocumentClassify(params: Record<string, unknown>): ClassificationResult {
+  private async handleDocumentClassify(params: Record<string, unknown>): Promise<ClassificationResult & { usage?: UsageInfo }> {
     const { content, documentId, categories } = params as {
       content?: string;
       documentId?: string;
       categories?: string[];
     };
 
+    let docContent = content;
     if (documentId) {
-      return this.document.classifyDocument(documentId, categories);
+      const doc = this.document.requireDocument(documentId);
+      docContent = doc.content;
     }
 
-    if (!content) {
+    if (!docContent) {
       throw new Error('Either content or documentId must be provided');
     }
 
-    return this.document.classify(content, categories);
+    const response = await this.aiService.classifyDocument({
+      content: docContent,
+      categories,
+    });
+
+    return {
+      ...response,
+      usage: {
+        inputTokens: docContent.length,
+        outputTokens: 20,
+        tokens: docContent.length + 20,
+        documents: 1,
+        requests: 1,
+        duration: 0,
+      },
+    };
   }
 
-  private handleDocumentSensitiveCheck(params: Record<string, unknown>): SensitiveCheckResult {
+  private async handleDocumentSensitiveCheck(params: Record<string, unknown>): Promise<SensitiveCheckResult & { usage?: UsageInfo }> {
     const { content, documentId } = params as {
       content?: string;
       documentId?: string;
     };
 
+    let docContent = content;
     if (documentId) {
-      return this.document.sensitiveCheckDocument(documentId);
+      const doc = this.document.requireDocument(documentId);
+      docContent = doc.content;
     }
 
-    if (!content) {
+    if (!docContent) {
       throw new Error('Either content or documentId must be provided');
     }
 
-    return this.document.sensitiveCheck(content);
+    const response = await this.aiService.sensitiveCheck({
+      content: docContent,
+    });
+
+    return {
+      ...response,
+      usage: {
+        inputTokens: docContent.length,
+        outputTokens: response.hits.length * 10,
+        tokens: docContent.length + response.hits.length * 10,
+        documents: 1,
+        requests: 1,
+        duration: 0,
+      },
+    };
   }
 
-  private handleImageDescribe(params: Record<string, unknown>): ImageDescriptionResult {
+  private async handleImageDescribe(params: Record<string, unknown>): Promise<ImageDescriptionResult & { usage?: UsageInfo }> {
     const { imageId, url, base64, ...options } = params as {
       imageId?: string;
       url?: string;
@@ -427,18 +609,42 @@ export class AIPlatformClient {
       detailLevel?: 'low' | 'medium' | 'high';
     };
 
+    let imageUrl = url;
+    let imageBase64 = base64;
+
     if (imageId) {
-      return this.image.describe(imageId, options);
+      const img = this.image.getImage(imageId);
+      if (img) {
+        imageUrl = img.url;
+        imageBase64 = img.base64;
+      }
     }
 
-    if (url || base64) {
-      return this.image.describe({ url, base64 }, options);
+    if (!imageUrl && !imageBase64) {
+      throw new Error('Either imageId, url, or base64 must be provided');
     }
 
-    throw new Error('Either imageId, url, or base64 must be provided');
+    const response = await this.aiService.describeImage({
+      imageUrl,
+      imageBase64,
+      detailLevel: options.detailLevel,
+      language: options.language,
+    });
+
+    return {
+      ...response,
+      usage: {
+        inputTokens: 100,
+        outputTokens: response.description.length,
+        tokens: 100 + response.description.length,
+        images: 1,
+        requests: 1,
+        duration: 0,
+      },
+    };
   }
 
-  private handleImageCompare(params: Record<string, unknown>): ImageCompareResult {
+  private async handleImageCompare(params: Record<string, unknown>): Promise<ImageCompareResult & { usage?: UsageInfo }> {
     const { image1, image2, ...options } = params as {
       image1: string;
       image2: string;
@@ -446,7 +652,23 @@ export class AIPlatformClient {
       method?: 'structural' | 'feature' | 'hybrid';
     };
 
-    return this.image.compare(image1, image2, options);
+    const response = await this.aiService.compareImages({
+      image1Url: image1,
+      image2Url: image2,
+      method: options.method,
+    });
+
+    return {
+      ...response,
+      usage: {
+        inputTokens: 200,
+        outputTokens: 50,
+        tokens: 250,
+        images: 2,
+        requests: 1,
+        duration: 0,
+      },
+    };
   }
 
   private handleTaskSubmit(params: Record<string, unknown>): Task {
@@ -454,12 +676,40 @@ export class AIPlatformClient {
       type: TaskType;
       taskParams: Record<string, unknown>;
       userId: string;
+      tenantId?: string;
     } & TaskSubmitOptions;
 
-    return this.task.submit(type, taskParams, userId, options);
+    const task = this.task.submit(type, taskParams, userId, options);
+
+    this.task.onComplete(task.id, (completedTask) => {
+      this.recordTaskUsage(completedTask);
+    });
+
+    return task;
   }
 
-  private handleTaskStatus(params: Record<string, unknown>) {
+  private recordTaskUsage(task: Task): void {
+    if (!task.usage) return;
+
+    const module = task.type.split('.')[0] as ModuleType;
+    const usage: UsageInfo = {
+      requests: 1,
+      duration: task.duration || 0,
+      inputTokens: task.usage.inputTokens,
+      outputTokens: task.usage.outputTokens,
+      tokens: task.usage.tokens,
+      images: task.usage.images,
+      documents: task.usage.documents,
+    };
+
+    this.recordUsage(task.userId, module, task.type as OperationType, usage, {
+      tenantId: task.tenantId,
+      success: task.status === 'completed',
+      traceId: task.id,
+    });
+  }
+
+  private handleTaskStatus(params: Record<string, unknown>): TaskStatus {
     const { taskId } = params as { taskId: string };
     return this.task.getStatus(taskId);
   }
@@ -475,8 +725,97 @@ export class AIPlatformClient {
 
   private handleTaskCancel(params: Record<string, unknown>) {
     const { taskId } = params as { taskId: string };
-    const cancelled = this.task.cancel(taskId);
-    return { cancelled };
+    return this.task.cancel(taskId);
+  }
+
+  private handleTaskRetry(params: Record<string, unknown>) {
+    const { taskId } = params as { taskId: string };
+    return this.task.retry(taskId);
+  }
+
+  private handleWorkflowCreate(params: Record<string, unknown>): Workflow {
+    const { definition, userId, tenantId } = params as {
+      definition: WorkflowDefinition;
+      userId?: string;
+      tenantId?: string;
+    };
+    return this.workflow.create(definition, userId, tenantId);
+  }
+
+  private async handleWorkflowStart(params: Record<string, unknown>): Promise<Workflow> {
+    const { workflowId } = params as { workflowId: string };
+    const workflow = await this.workflow.start(workflowId);
+
+    this.workflow.onComplete(workflowId, (completedWorkflow) => {
+      this.recordWorkflowUsage(completedWorkflow);
+    });
+
+    return workflow;
+  }
+
+  private recordWorkflowUsage(workflow: Workflow): void {
+    for (const step of workflow.steps) {
+      if (step.status !== 'completed' || !step.usage) continue;
+
+      const module = step.type.split('.')[0] as ModuleType;
+      const usage: UsageInfo = {
+        requests: 1,
+        duration: step.duration || 0,
+        inputTokens: step.usage.inputTokens,
+        outputTokens: step.usage.outputTokens,
+        tokens: step.usage.tokens,
+        images: step.usage.images,
+        documents: step.usage.documents,
+      };
+
+      this.recordUsage(
+        workflow.userId || 'unknown',
+        module,
+        step.type as OperationType,
+        usage,
+        {
+          tenantId: workflow.tenantId,
+          success: step.status === 'completed',
+          traceId: `${workflow.id}_${step.id}`,
+        }
+      );
+    }
+  }
+
+  private handleWorkflowStatus(params: Record<string, unknown>): Workflow {
+    const { workflowId } = params as { workflowId: string };
+    return this.workflow.require(workflowId);
+  }
+
+  private handleWorkflowStepGet(params: Record<string, unknown>): WorkflowStep {
+    const { workflowId, stepId } = params as { workflowId: string; stepId: string };
+    const step = this.workflow.getStep(workflowId, stepId);
+    if (!step) {
+      throw new Error(`Step ${stepId} not found in workflow ${workflowId}`);
+    }
+    return step;
+  }
+
+  private handleWorkflowStepRetry(params: Record<string, unknown>) {
+    const { workflowId, stepId } = params as { workflowId: string; stepId: string };
+    const success = this.workflow.retryStep(workflowId, stepId);
+    return { success, stepId };
+  }
+
+  private handleWorkflowRetry(params: Record<string, unknown>) {
+    const { workflowId } = params as { workflowId: string };
+    const retried = this.workflow.retryFailedSteps(workflowId);
+    return { success: retried > 0, retriedSteps: retried };
+  }
+
+  private handleWorkflowCancel(params: Record<string, unknown>) {
+    const { workflowId } = params as { workflowId: string };
+    const success = this.workflow.cancel(workflowId);
+    return { success, workflowId };
+  }
+
+  private handleWorkflowList(params: Record<string, unknown>) {
+    return this.workflow.list(params as Parameters<WorkflowManager['list']>[0]);
   }
 
   private handleAuditLogList(params: Record<string, unknown>): PaginationResult<AuditLogEntry> {
@@ -514,24 +853,5 @@ export class AIPlatformClient {
 
   private handleUsageStats(params: Record<string, unknown>) {
     return this.usage.getStats(params as Parameters<UsageManager['getStats']>[0]);
-  }
-
-  private generateMockReply(message: string, systemPrompt?: string): string {
-    const seed = message.length;
-    const replies = [
-      `好的，我来帮你分析这个问题。关于"${message.substring(0, Math.min(20, message.length))}..."，我的看法是这样的...`,
-      `这是一个很好的问题！关于你提到的内容，让我从几个角度来分析一下...`,
-      `我理解你的意思。基于你提供的信息，我给出以下建议：首先...其次...最后...`,
-      `收到你的消息了！这个话题很有意思，让我来详细回答一下...`,
-      `好的，我来处理这个请求。根据我的分析，你需要的是...`,
-    ];
-
-    let reply = replies[seed % replies.length];
-
-    if (systemPrompt) {
-      reply = `【系统提示】${reply}`;
-    }
-
-    return reply;
   }
 }

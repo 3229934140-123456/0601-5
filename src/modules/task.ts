@@ -1,6 +1,23 @@
 import { generateTaskId, sleep } from '../utils';
+import {
+  DocumentSummarizeRequest,
+  DocumentSummarizeResponse,
+  DocumentKeyPointsRequest,
+  DocumentKeyPointsResponse,
+  DocumentClassifyRequest,
+  DocumentClassifyResponse,
+  SensitiveCheckRequest,
+  SensitiveCheckResponse,
+  ImageDescribeRequest,
+  ImageDescribeResponse,
+  ImageCompareRequest,
+  ImageCompareResponse,
+  ChatRequest,
+  ChatResponse,
+  AIServiceManager,
+} from '../adapters';
 
-export type TaskStatus = 'pending' | 'queued' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
+export type TaskStatus = 'pending' | 'queued' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
 
 export type TaskType =
   | 'document.summarize'
@@ -12,33 +29,76 @@ export type TaskType =
   | 'session.chat'
   | 'custom';
 
+export interface TaskError {
+  code: string | number;
+  message: string;
+  retryable: boolean;
+  details?: Record<string, unknown>;
+}
+
 export interface Task<TResult = unknown> {
   id: string;
   type: TaskType;
   status: TaskStatus;
   userId: string;
+  tenantId?: string;
   priority?: number;
   params: Record<string, unknown>;
   result?: TResult;
-  error?: string;
+  error?: TaskError;
   progress: number;
   progressText?: string;
+  usage?: {
+    tokens?: number;
+    inputTokens?: number;
+    outputTokens?: number;
+    images?: number;
+    documents?: number;
+  };
   createdAt: number;
   startedAt?: number;
   completedAt?: number;
+  cancelledAt?: number;
   duration?: number;
   queuePosition?: number;
   callbackUrl?: string;
+  retries: number;
+  maxRetries: number;
   metadata?: Record<string, unknown>;
 }
 
 export interface TaskSubmitOptions {
   priority?: number;
   callbackUrl?: string;
+  maxRetries?: number;
+  tenantId?: string;
   metadata?: Record<string, unknown>;
 }
 
-export type TaskHandler = (task: Task) => Promise<unknown>;
+export type TaskHandler = (task: Task, onProgress?: (progress: number, text?: string) => void) => Promise<{
+  result: unknown;
+  usage?: Task['usage'];
+}>;
+
+const TERMINAL_STATUSES: TaskStatus[] = ['completed', 'failed', 'cancelled'];
+const ACTIVE_STATUSES: TaskStatus[] = ['queued', 'running', 'cancelling'];
+
+function isTerminalStatus(status: TaskStatus): boolean {
+  return TERMINAL_STATUSES.includes(status);
+}
+
+function canTransition(from: TaskStatus, to: TaskStatus): boolean {
+  const transitions: Record<TaskStatus, TaskStatus[]> = {
+    pending: ['queued', 'cancelled'],
+    queued: ['running', 'cancelled'],
+    running: ['completed', 'failed', 'cancelling'],
+    cancelling: ['cancelled', 'completed', 'failed'],
+    completed: [],
+    failed: ['queued'],
+    cancelled: ['queued'],
+  };
+  return transitions[from].includes(to);
+}
 
 export class TaskManager {
   private tasks: Map<string, Task> = new Map();
@@ -46,44 +106,217 @@ export class TaskManager {
   private handlers: Map<TaskType, TaskHandler> = new Map();
   private maxConcurrent: number = 3;
   private runningCount: number = 0;
-  private callbacks: Map<string, (result: Task) => void> = new Map();
+  private callbacks: Map<string, (task: Task) => void> = new Map();
   private maxQueueSize: number = 1000;
+  private aiServiceManager: AIServiceManager;
 
-  constructor() {
+  constructor(aiServiceManager?: AIServiceManager) {
+    this.aiServiceManager = aiServiceManager || new AIServiceManager();
     this.registerDefaultHandlers();
   }
 
   private registerDefaultHandlers(): void {
-    this.registerHandler('document.summarize', async (task) => {
-      const content = task.params.content as string;
-      const length = content?.length || 0;
-      let progress = 0;
+    this.registerHandler('document.summarize', async (task, onProgress) => {
+      onProgress?.(10, '正在处理文档...');
+      await sleep(80);
 
-      for (let i = 0; i < 10; i++) {
-        await sleep(50);
-        progress += 10;
-        this.updateProgress(task.id, progress, `处理中 ${progress}%`);
-      }
+      onProgress?.(30, '正在分析内容...');
+      const content = task.params.content as string;
+
+      const request: DocumentSummarizeRequest = {
+        content,
+        maxLength: task.params.maxLength as number,
+        ratio: task.params.ratio as number,
+      };
+
+      onProgress?.(60, '正在生成摘要...');
+      const response = await this.aiServiceManager.summarizeDocument(request);
+
+      onProgress?.(100, '摘要生成完成');
 
       return {
-        summary: content?.substring(0, Math.min(100, length)) + '...',
-        wordCount: Math.floor(length / 5),
-        compressionRatio: 0.3,
+        result: response,
+        usage: {
+          inputTokens: content?.length || 0,
+          outputTokens: response.summary.length,
+          tokens: (content?.length || 0) + response.summary.length,
+          documents: 1,
+        },
       };
     });
 
-    this.registerHandler('image.describe', async (task) => {
-      await sleep(200);
+    this.registerHandler('document.extractKeyPoints', async (task, onProgress) => {
+      onProgress?.(10, '正在读取文档...');
+      await sleep(50);
+
+      onProgress?.(40, '正在分析要点...');
+      const content = task.params.content as string;
+
+      const request: DocumentKeyPointsRequest = {
+        content,
+        maxPoints: task.params.maxPoints as number,
+      };
+
+      onProgress?.(70, '正在提取要点...');
+      const response = await this.aiServiceManager.extractKeyPoints(request);
+
+      onProgress?.(100, '要点提取完成');
+
       return {
-        description: '一张图片的描述',
-        tags: ['图片', '示例'],
-        confidence: 0.85,
+        result: response,
+        usage: {
+          inputTokens: content?.length || 0,
+          outputTokens: response.keyPoints.reduce((sum, kp) => sum + kp.text.length, 0),
+          tokens: (content?.length || 0) + response.keyPoints.reduce((sum, kp) => sum + kp.text.length, 0),
+          documents: 1,
+        },
+      };
+    });
+
+    this.registerHandler('document.classify', async (task, onProgress) => {
+      onProgress?.(20, '正在分析文档...');
+      const content = task.params.content as string;
+
+      const request: DocumentClassifyRequest = {
+        content,
+        categories: task.params.categories as string[],
+      };
+
+      onProgress?.(60, '正在分类...');
+      const response = await this.aiServiceManager.classifyDocument(request);
+
+      onProgress?.(100, '分类完成');
+
+      return {
+        result: response,
+        usage: {
+          inputTokens: content?.length || 0,
+          outputTokens: 20,
+          tokens: (content?.length || 0) + 20,
+          documents: 1,
+        },
+      };
+    });
+
+    this.registerHandler('document.sensitiveCheck', async (task, onProgress) => {
+      onProgress?.(20, '正在扫描内容...');
+      const content = task.params.content as string;
+
+      const request: SensitiveCheckRequest = {
+        content,
+      };
+
+      onProgress?.(60, '正在检测敏感词...');
+      const response = await this.aiServiceManager.sensitiveCheck(request);
+
+      onProgress?.(100, '检测完成');
+
+      return {
+        result: response,
+        usage: {
+          inputTokens: content?.length || 0,
+          outputTokens: response.hits.length * 10,
+          tokens: (content?.length || 0) + response.hits.length * 10,
+          documents: 1,
+        },
+      };
+    });
+
+    this.registerHandler('image.describe', async (task, onProgress) => {
+      onProgress?.(20, '正在加载图片...');
+      await sleep(60);
+
+      onProgress?.(50, '正在分析图片...');
+      const request: ImageDescribeRequest = {
+        imageUrl: task.params.imageUrl as string,
+        imageBase64: task.params.imageBase64 as string,
+        detailLevel: task.params.detailLevel as 'low' | 'medium' | 'high',
+        language: task.params.language as string,
+      };
+
+      onProgress?.(80, '正在生成描述...');
+      const response = await this.aiServiceManager.describeImage(request);
+
+      onProgress?.(100, '描述生成完成');
+
+      return {
+        result: response,
+        usage: {
+          inputTokens: 100,
+          outputTokens: response.description.length,
+          tokens: 100 + response.description.length,
+          images: 1,
+        },
+      };
+    });
+
+    this.registerHandler('image.compare', async (task, onProgress) => {
+      onProgress?.(20, '正在加载图片...');
+      await sleep(60);
+
+      onProgress?.(50, '正在比对特征...');
+      const request: ImageCompareRequest = {
+        image1Url: task.params.image1 as string,
+        image2Url: task.params.image2 as string,
+        method: task.params.method as 'structural' | 'feature' | 'hybrid',
+      };
+
+      onProgress?.(80, '正在计算相似度...');
+      const response = await this.aiServiceManager.compareImages(request);
+
+      onProgress?.(100, '比对完成');
+
+      return {
+        result: response,
+        usage: {
+          inputTokens: 200,
+          outputTokens: 50,
+          tokens: 250,
+          images: 2,
+        },
+      };
+    });
+
+    this.registerHandler('session.chat', async (task, onProgress) => {
+      onProgress?.(20, '正在构建上下文...');
+      const messages = task.params.messages as { role: string; content: string }[];
+
+      const request: ChatRequest = {
+        messages: messages as ChatRequest['messages'],
+        model: task.params.model as string,
+        temperature: task.params.temperature as number,
+        maxTokens: task.params.maxTokens as number,
+      };
+
+      onProgress?.(50, '正在生成回复...');
+      const response = await this.aiServiceManager.chat(request);
+
+      onProgress?.(100, '回复生成完成');
+
+      return {
+        result: {
+          message: {
+            role: 'assistant',
+            content: response.content,
+          },
+          model: response.model,
+          finishReason: response.finishReason,
+        },
+        usage: {
+          inputTokens: response.usage.inputTokens,
+          outputTokens: response.usage.outputTokens,
+          tokens: response.usage.totalTokens,
+        },
       };
     });
   }
 
   registerHandler(type: TaskType, handler: TaskHandler): void {
     this.handlers.set(type, handler);
+  }
+
+  setAIServiceManager(manager: AIServiceManager): void {
+    this.aiServiceManager = manager;
   }
 
   submit(
@@ -105,11 +338,14 @@ export class TaskManager {
       type,
       status: 'queued',
       userId,
+      tenantId: options.tenantId,
       priority: options.priority || 0,
       params: { ...params },
       progress: 0,
       createdAt: Date.now(),
       callbackUrl: options.callbackUrl,
+      retries: 0,
+      maxRetries: options.maxRetries ?? 0,
       metadata: options.metadata,
     };
 
@@ -128,7 +364,7 @@ export class TaskManager {
     let insertIndex = 0;
     for (let i = 0; i < this.queue.length; i++) {
       const queuedTask = this.tasks.get(this.queue[i]);
-      if (queuedTask && (queuedTask.priority || 0) > priority) {
+      if (queuedTask && (queuedTask.priority || 0) >= priority) {
         insertIndex = i + 1;
       } else {
         break;
@@ -146,6 +382,32 @@ export class TaskManager {
         task.queuePosition = index + 1;
       }
     });
+  }
+
+  private transitionStatus(taskId: string, newStatus: TaskStatus): boolean {
+    const task = this.tasks.get(taskId);
+    if (!task) return false;
+
+    if (!canTransition(task.status, newStatus)) {
+      return false;
+    }
+
+    task.status = newStatus;
+
+    if (newStatus === 'cancelled') {
+      task.cancelledAt = Date.now();
+      task.completedAt = task.cancelledAt;
+      task.duration = task.startedAt ? task.cancelledAt - task.startedAt : 0;
+    } else if (isTerminalStatus(newStatus)) {
+      if (!task.completedAt) {
+        task.completedAt = Date.now();
+      }
+      if (task.startedAt && !task.duration) {
+        task.duration = task.completedAt - task.startedAt;
+      }
+    }
+
+    return true;
   }
 
   private processQueue(): void {
@@ -167,29 +429,41 @@ export class TaskManager {
       return;
     }
 
-    this.runningCount++;
-    task.status = 'running';
+    if (!this.transitionStatus(taskId, 'running')) {
+      this.updateQueuePositions();
+      this.processQueue();
+      return;
+    }
+
     task.startedAt = Date.now();
     task.queuePosition = undefined;
+    this.runningCount++;
 
     this.updateQueuePositions();
 
     this.executeTask(task)
-      .then((result) => {
-        task.status = 'completed';
-        task.result = result;
-        task.completedAt = Date.now();
-        task.duration = task.completedAt - (task.startedAt || 0);
-        task.progress = 100;
-        task.progressText = '完成';
+      .then(({ result, usage }) => {
+        const currentTask = this.tasks.get(taskId)!;
+
+        if (currentTask.status === 'cancelling') {
+          this.transitionStatus(taskId, 'cancelled');
+        } else {
+          task.result = result;
+          task.usage = usage;
+          this.transitionStatus(taskId, 'completed');
+        }
 
         this.invokeCallback(task);
       })
       .catch((error) => {
-        task.status = 'failed';
-        task.error = error.message || String(error);
-        task.completedAt = Date.now();
-        task.duration = task.completedAt - (task.startedAt || 0);
+        const currentTask = this.tasks.get(taskId)!;
+
+        if (currentTask.status === 'cancelling') {
+          this.transitionStatus(taskId, 'cancelled');
+        } else {
+          task.error = this.normalizeError(error);
+          this.transitionStatus(taskId, 'failed');
+        }
 
         this.invokeCallback(task);
       })
@@ -199,13 +473,39 @@ export class TaskManager {
       });
   }
 
-  private async executeTask(task: Task): Promise<unknown> {
+  private normalizeError(error: unknown): TaskError {
+    if (error && typeof error === 'object') {
+      const err = error as Record<string, unknown>;
+      return {
+        code: err.code !== undefined ? (err.code as string | number) : -1,
+        message: err.message ? String(err.message) : String(error),
+        retryable: typeof err.retryable === 'boolean' ? err.retryable : false,
+        details: err.details as Record<string, unknown> | undefined,
+      };
+    }
+
+    return {
+      code: -1,
+      message: String(error),
+      retryable: false,
+    };
+  }
+
+  private async executeTask(task: Task): Promise<{ result: unknown; usage?: Task['usage'] }> {
     const handler = this.handlers.get(task.type);
     if (!handler) {
       throw new Error(`No handler for task type: ${task.type}`);
     }
 
-    return await handler(task);
+    const onProgress = (progress: number, text?: string) => {
+      const currentTask = this.tasks.get(task.id);
+      if (currentTask && !isTerminalStatus(currentTask.status) && currentTask.status !== 'cancelling') {
+        currentTask.progress = Math.max(0, Math.min(100, progress));
+        if (text) currentTask.progressText = text;
+      }
+    };
+
+    return await handler(task, onProgress);
   }
 
   private invokeCallback(task: Task): void {
@@ -238,10 +538,11 @@ export class TaskManager {
           status: task.status,
           result: task.result,
           error: task.error,
+          usage: task.usage,
         }),
       });
     } catch {
-      // webhook call failed, could add retry logic here
+      // webhook call failed
     }
   }
 
@@ -264,9 +565,10 @@ export class TaskManager {
   getResult(taskId: string): {
     status: TaskStatus;
     result?: unknown;
-    error?: string;
+    error?: TaskError;
     progress: number;
     progressText?: string;
+    usage?: Task['usage'];
   } {
     const task = this.require(taskId);
     return {
@@ -275,6 +577,7 @@ export class TaskManager {
       error: task.error,
       progress: task.progress,
       progressText: task.progressText,
+      usage: task.usage,
     };
   }
 
@@ -286,7 +589,7 @@ export class TaskManager {
         return;
       }
 
-      if (task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled') {
+      if (isTerminalStatus(task.status)) {
         resolve(task);
         return;
       }
@@ -301,7 +604,7 @@ export class TaskManager {
           return;
         }
 
-        if (currentTask.status === 'completed' || currentTask.status === 'failed' || currentTask.status === 'cancelled') {
+        if (isTerminalStatus(currentTask.status)) {
           clearInterval(checkInterval);
           resolve(currentTask);
           return;
@@ -317,6 +620,7 @@ export class TaskManager {
 
   list(options: {
     userId?: string;
+    tenantId?: string;
     status?: TaskStatus;
     type?: TaskType;
     page?: number;
@@ -329,6 +633,10 @@ export class TaskManager {
 
     if (options.userId) {
       tasks = tasks.filter((t) => t.userId === options.userId);
+    }
+
+    if (options.tenantId) {
+      tasks = tasks.filter((t) => t.tenantId === options.tenantId);
     }
 
     if (options.status) {
@@ -352,29 +660,67 @@ export class TaskManager {
     };
   }
 
-  cancel(taskId: string): boolean {
+  cancel(taskId: string): { success: boolean; status: TaskStatus; message?: string } {
     const task = this.tasks.get(taskId);
-    if (!task) return false;
+    if (!task) {
+      return { success: false, status: 'failed', message: 'Task not found' };
+    }
 
-    if (task.status === 'queued' || task.status === 'pending') {
-      task.status = 'cancelled';
-      task.completedAt = Date.now();
+    if (isTerminalStatus(task.status)) {
+      return { success: false, status: task.status, message: `Task already ${task.status}` };
+    }
+
+    if (task.status === 'queued') {
+      this.transitionStatus(taskId, 'cancelled');
       this.queue = this.queue.filter((id) => id !== taskId);
       this.updateQueuePositions();
-      return true;
+      return { success: true, status: 'cancelled', message: 'Task cancelled from queue' };
     }
 
     if (task.status === 'running') {
-      task.status = 'cancelled';
-      return true;
+      this.transitionStatus(taskId, 'cancelling');
+      return { success: true, status: 'cancelling', message: 'Task cancellation requested' };
     }
 
-    return false;
+    return { success: false, status: task.status, message: `Cannot cancel task in status: ${task.status}` };
+  }
+
+  retry(taskId: string): { success: boolean; status?: TaskStatus; message?: string } {
+    const task = this.tasks.get(taskId);
+    if (!task) {
+      return { success: false, message: 'Task not found' };
+    }
+
+    if (task.status !== 'failed' && task.status !== 'cancelled') {
+      return { success: false, status: task.status, message: 'Only failed or cancelled tasks can be retried' };
+    }
+
+    if (task.retries >= task.maxRetries) {
+      return { success: false, status: task.status, message: 'Max retries exceeded' };
+    }
+
+    task.retries++;
+    task.error = undefined;
+    task.result = undefined;
+    task.progress = 0;
+    task.progressText = undefined;
+    task.startedAt = undefined;
+    task.completedAt = undefined;
+    task.cancelledAt = undefined;
+    task.duration = undefined;
+
+    this.transitionStatus(taskId, 'queued');
+    this.addToQueue(taskId, task.priority || 0);
+
+    process.nextTick(() => this.processQueue());
+
+    return { success: true, status: 'queued', message: 'Task requeued' };
   }
 
   updateProgress(taskId: string, progress: number, progressText?: string): void {
     const task = this.tasks.get(taskId);
     if (!task) return;
+    if (isTerminalStatus(task.status) || task.status === 'cancelling') return;
 
     task.progress = Math.max(0, Math.min(100, progress));
     if (progressText) {
@@ -386,7 +732,7 @@ export class TaskManager {
     const task = this.tasks.get(taskId);
     if (!task) return;
 
-    if (task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled') {
+    if (isTerminalStatus(task.status)) {
       callback(task);
       return;
     }
@@ -406,6 +752,7 @@ export class TaskManager {
   getQueueStats(): {
     queued: number;
     running: number;
+    cancelling: number;
     completed: number;
     failed: number;
     cancelled: number;
@@ -413,6 +760,7 @@ export class TaskManager {
     const stats = {
       queued: 0,
       running: 0,
+      cancelling: 0,
       completed: 0,
       failed: 0,
       cancelled: 0,

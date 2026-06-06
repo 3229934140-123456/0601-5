@@ -4,6 +4,7 @@ export type ModuleType =
   | 'document'
   | 'image'
   | 'task'
+  | 'workflow'
   | 'audit'
   | 'config';
 
@@ -18,6 +19,7 @@ export type OperationType =
   | 'prompt.template.get'
   | 'prompt.template.update'
   | 'prompt.template.delete'
+  | 'prompt.template.search'
   | 'document.summarize'
   | 'document.extractKeyPoints'
   | 'document.classify'
@@ -29,6 +31,15 @@ export type OperationType =
   | 'task.result'
   | 'task.list'
   | 'task.cancel'
+  | 'task.retry'
+  | 'workflow.create'
+  | 'workflow.start'
+  | 'workflow.status'
+  | 'workflow.step.get'
+  | 'workflow.step.retry'
+  | 'workflow.retry'
+  | 'workflow.cancel'
+  | 'workflow.list'
   | 'audit.log.list'
   | 'audit.log.get'
   | 'config.get'
@@ -106,3 +117,31 @@ export interface PaginationResult<T> {
   pageSize: number;
   hasMore: boolean;
 }
+
+export type TaskStatus = 'pending' | 'queued' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
+
+export type TaskType =
+  | 'document.summarize'
+  | 'document.extractKeyPoints'
+  | 'document.classify'
+  | 'document.sensitiveCheck'
+  | 'image.describe'
+  | 'image.compare'
+  | 'session.chat';
+
+export type WorkflowStatus = 'idle' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
+export type StepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped' | 'cancelled';
+
+export type WorkflowStepType =
+  | 'document.summarize'
+  | 'document.extractKeyPoints'
+  | 'document.classify'
+  | 'document.sensitiveCheck'
+  | 'image.describe'
+  | 'image.compare'
+  | 'session.chat'
+  | 'condition'
+  | 'transform'
+  | 'custom';
+
+export type FailureStrategy = 'continue' | 'stop' | 'retry';
