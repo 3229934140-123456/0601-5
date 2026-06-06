@@ -109,10 +109,16 @@ export class TaskManager {
   private callbacks: Map<string, (task: Task) => void> = new Map();
   private maxQueueSize: number = 1000;
   private aiServiceManager: AIServiceManager;
+  private imageManager?: any;
 
-  constructor(aiServiceManager?: AIServiceManager) {
+  constructor(aiServiceManager?: AIServiceManager, imageManager?: any) {
     this.aiServiceManager = aiServiceManager || new AIServiceManager();
+    this.imageManager = imageManager;
     this.registerDefaultHandlers();
+  }
+
+  setImageManager(manager: any): void {
+    this.imageManager = manager;
   }
 
   private registerDefaultHandlers(): void {
@@ -227,14 +233,22 @@ export class TaskManager {
 
       const { url, base64, imageId, imageUrl, imageBase64, detailLevel, language } = task.params;
 
-      const finalImageUrl = url || imageUrl;
-      const finalImageBase64 = base64 || imageBase64;
+      let finalImageUrl = url || imageUrl;
+      let finalImageBase64 = base64 || imageBase64;
+
+      if (imageId && this.imageManager) {
+        const img = this.imageManager.getImage(imageId as string);
+        if (img) {
+          finalImageUrl = finalImageUrl || img.url;
+          finalImageBase64 = finalImageBase64 || img.base64;
+        }
+      }
 
       if (!finalImageUrl && !finalImageBase64) {
-        const err: any = new Error('Missing required parameter: either url or base64 must be provided');
+        const err: any = new Error('Missing image input: one of url, base64, or imageId must be provided');
         err.code = 'INVALID_PARAMS';
         err.retryable = false;
-        err.details = { missingFields: ['url'] };
+        err.details = { missingFields: ['image input (url / base64 / imageId)'] };
         throw err;
       }
 
@@ -410,7 +424,7 @@ export class TaskManager {
       createdAt: Date.now(),
       callbackUrl: options.callbackUrl,
       retries: 0,
-      maxRetries: options.maxRetries ?? 0,
+      maxRetries: options.maxRetries ?? 3,
       metadata: options.metadata,
     };
 
@@ -750,7 +764,7 @@ export class TaskManager {
     return { success: false, status: task.status, message: `Cannot cancel task in status: ${task.status}` };
   }
 
-  retry(taskId: string): { success: boolean; status?: TaskStatus; message?: string } {
+  retry(taskId: string): { success: boolean; status?: TaskStatus; message?: string; maxRetries?: number; currentRetries?: number } {
     const task = this.tasks.get(taskId);
     if (!task) {
       return { success: false, message: 'Task not found' };
@@ -761,12 +775,19 @@ export class TaskManager {
     }
 
     if (task.retries >= task.maxRetries) {
-      return { success: false, status: task.status, message: 'Max retries exceeded' };
+      return {
+        success: false,
+        status: task.status,
+        message: `Max retries exceeded: current=${task.retries}, max=${task.maxRetries}`,
+        maxRetries: task.maxRetries,
+        currentRetries: task.retries,
+      };
     }
 
     task.retries++;
     task.error = undefined;
     task.result = undefined;
+    task.usage = undefined;
     task.progress = 0;
     task.progressText = undefined;
     task.startedAt = undefined;

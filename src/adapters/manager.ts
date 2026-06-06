@@ -67,6 +67,18 @@ export class AIServiceManager {
     return this.adapters.get(name);
   }
 
+  getTextAdapter(): AIServiceAdapter {
+    return this.requireAdapter('text');
+  }
+
+  getImageAdapter(): AIServiceAdapter {
+    return this.requireAdapter('image');
+  }
+
+  getDocumentAdapter(): AIServiceAdapter {
+    return this.requireAdapter('document');
+  }
+
   requireAdapter(type: AIServiceType, name?: string): AIServiceAdapter {
     let adapter: AIServiceAdapter | undefined;
 

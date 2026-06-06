@@ -68,8 +68,8 @@ export class AIPlatformClient {
     this.prompt = new PromptManager();
     this.document = new DocumentManager();
     this.image = new ImageManager();
-    this.task = new TaskManager(this.aiService);
-    this.workflow = new WorkflowManager(this.aiService);
+    this.task = new TaskManager(this.aiService, this.image);
+    this.workflow = new WorkflowManager(this.aiService, this.image);
   }
 
   setDefaultPermissionContext(context: PermissionContext): void {
@@ -375,24 +375,28 @@ export class AIPlatformClient {
 
     const session = this.session.require(sessionId);
 
+    const historyMessages = this.session.getContextMessages(sessionId, false).map((m) => ({
+      role: m.role as 'user' | 'assistant',
+      content: m.content,
+    }));
+
+    const chatMessages = [
+      ...(session.systemPrompt
+        ? [{ role: 'system' as const, content: session.systemPrompt }]
+        : []),
+      ...historyMessages,
+      { role: 'user' as const, content: message },
+    ];
+
+    const chatResult = await this.aiService.chat({
+      messages: chatMessages,
+      model: options?.model || session.model,
+      temperature: options?.temperature || session.temperature,
+    });
+
     this.session.addMessage(sessionId, {
       role: 'user',
       content: message,
-    });
-
-    const chatResult = await this.aiService.chat({
-      messages: [
-        ...(session.systemPrompt
-          ? [{ role: 'system' as const, content: session.systemPrompt }]
-          : []),
-        ...this.session.getContextMessages(sessionId, false).map((m) => ({
-          role: m.role as 'user' | 'assistant',
-          content: m.content,
-        })),
-        { role: 'user', content: message },
-      ],
-      model: options?.model || session.model,
-      temperature: options?.temperature || session.temperature,
     });
 
     const reply = this.session.addMessage(sessionId, {

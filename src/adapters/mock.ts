@@ -96,6 +96,10 @@ export class MockImageAIService extends BaseAIServiceAdapter {
     return ['image.describe', 'image.compare'].includes(operation);
   }
 
+  getSupportedModels(): string[] {
+    return ['mock-image-v1', 'mock-image-v2', 'mock-image-vision'];
+  }
+
   async describe(request: ImageDescribeRequest): Promise<ImageDescribeResponse> {
     await sleep(this.delay);
 
@@ -236,6 +240,10 @@ export class MockDocumentAIService extends BaseAIServiceAdapter {
       'document.classify',
       'document.sensitiveCheck',
     ].includes(operation);
+  }
+
+  getSupportedModels(): string[] {
+    return ['mock-doc-v1', 'mock-doc-v2', 'mock-doc-pro'];
   }
 
   async summarize(request: DocumentSummarizeRequest): Promise<DocumentSummarizeResponse> {

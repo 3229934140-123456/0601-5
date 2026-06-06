@@ -112,17 +112,23 @@ export interface Workflow {
 export class WorkflowManager {
   private workflows: Map<string, Workflow> = new Map();
   private aiServiceManager: AIServiceManager;
+  private imageManager?: any;
   private maxConcurrent: number = 5;
   private runningCount: number = 0;
   private runningWorkflows: Set<string> = new Set();
   private callbacks: Map<string, (workflow: Workflow) => void> = new Map();
 
-  constructor(aiServiceManager?: AIServiceManager) {
+  constructor(aiServiceManager?: AIServiceManager, imageManager?: any) {
     this.aiServiceManager = aiServiceManager || new AIServiceManager();
+    this.imageManager = imageManager;
   }
 
   setAIServiceManager(manager: AIServiceManager): void {
     this.aiServiceManager = manager;
+  }
+
+  setImageManager(manager: any): void {
+    this.imageManager = manager;
   }
 
   create(definition: WorkflowDefinition, userId?: string, tenantId?: string): Workflow {
@@ -433,10 +439,32 @@ export class WorkflowManager {
   }
 
   private async executeImageDescribe(params: Record<string, unknown>): Promise<ImageDescribeResponse> {
+    const { url, base64, imageId, imageUrl, imageBase64, detailLevel, language } = params;
+
+    let finalImageUrl = url || imageUrl;
+    let finalImageBase64 = base64 || imageBase64;
+
+    if (imageId && this.imageManager) {
+      const img = this.imageManager.getImage(imageId as string);
+      if (img) {
+        finalImageUrl = finalImageUrl || img.url;
+        finalImageBase64 = finalImageBase64 || img.base64;
+      }
+    }
+
+    if (!finalImageUrl && !finalImageBase64) {
+      const err: any = new Error('Missing image input: one of url, base64, or imageId must be provided');
+      err.code = 'INVALID_PARAMS';
+      err.retryable = false;
+      err.details = { missingFields: ['image input (url / base64 / imageId)'] };
+      throw err;
+    }
+
     const response = await this.aiServiceManager.describeImage({
-      imageUrl: params.imageUrl as string,
-      imageBase64: params.imageBase64 as string,
-      detailLevel: params.detailLevel as 'low' | 'medium' | 'high',
+      imageUrl: finalImageUrl as string,
+      imageBase64: finalImageBase64 as string,
+      detailLevel: detailLevel as 'low' | 'medium' | 'high',
+      language: language as string | undefined,
     });
     return response;
   }
