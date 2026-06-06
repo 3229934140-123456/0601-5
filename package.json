@@ -1,0 +1,22 @@
+{
+  "name": "ai-platform-sdk",
+  "version": "1.0.0",
+  "description": "AI 应用平台类库 - 提供会话、提示词、文档、图片、任务、审计、配置七大模块能力",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "node examples/usage.js"
+  },
+  "keywords": ["ai", "sdk", "platform", "llm", "image", "document"],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "@types/node": "^20.10.0"
+  },
+  "dependencies": {
+    "uuid": "^9.0.0"
+  }
+}
